@@ -152,13 +152,13 @@ def compute_k_table_kernel(
 # =============================================================================
 
 @triton.jit
-def enable_matmul_bipolar_tiled_kernel(
+def enable_matmul_tiled_kernel(
     cum_ptr,           # (D, stoc_len+1, V) int16
     k_table_ptr,       # (D, V) int16
     boundary_a_ptr,    # (D, N) int16 — transposed for coalesced access
     boundary_b_ptr,    # (D, M) int16 — transposed for coalesced access
-    sign_a_ptr,        # (D, N) int8 — transposed for coalesced access
-    sign_b_ptr,        # (D, M) int8 — transposed for coalesced access
+    sign_a_ptr,        # (D, N) int8 — only read when IS_BIPOLAR
+    sign_b_ptr,        # (D, M) int8 — only read when IS_BIPOLAR
     output_ptr,        # (N, M) float32
     N, M, D,
     stoc_len: tl.constexpr,
@@ -167,85 +167,15 @@ def enable_matmul_bipolar_tiled_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    IS_BIPOLAR: tl.constexpr,
 ):
-    """
-    Tiled enable-signal matmul (bipolar sign-magnitude).
-
-    BLOCK_K tiles the D dimension with static_range for compiler unrolling,
-    allowing better instruction scheduling and memory access pipelining.
-    Boundary/sign tensors use (D, N) layout for coalesced thread access.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-    gather_mask = m_mask[:, None] & n_mask[None, :]
-
-    cum_stride_d = (stoc_len + 1) * V
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    num_k_blocks = (D + BLOCK_K - 1) // BLOCK_K
-    for k_block in range(num_k_blocks):
-        k_start = k_block * BLOCK_K
-        for ki in tl.static_range(BLOCK_K):
-            d = k_start + ki
-            if d < D:
-                # Load signs as int8, cast for zero-check and arithmetic
-                sa_i8 = tl.load(sign_a_ptr + d * N + m_offsets, mask=m_mask, other=0)
-                # Skip if all sign_a are zero — no contribution to acc
-                if tl.sum(tl.abs(sa_i8).to(tl.int32)) > 0:
-                    sb_i8 = tl.load(sign_b_ptr + d * M + n_offsets, mask=n_mask, other=0)
-                    # Skip if all sign_b are zero
-                    if tl.sum(tl.abs(sb_i8).to(tl.int32)) > 0:
-                        sa = sa_i8.to(tl.float32)
-                        sb = sb_i8.to(tl.float32)
-                        # Load boundaries (coalesced — (D,N) layout)
-                        ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-                        bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-
-                        # k_table lookup: k[d, ba] -> [BLOCK_M]
-                        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-                        # cum_indicator gather: cum[d, k_vals[i], bb[j]] -> [BLOCK_M, BLOCK_N]
-                        cum_offsets = (d * cum_stride_d
-                                       + k_vals[:, None].to(tl.int64) * V
-                                       + bb[None, :].to(tl.int64))
-                        counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
-
-                        acc += counts * sa[:, None] * sb[None, :]
-
-    # Apply loop-invariant scale once (enables FMA fusion in the inner loop)
-    acc *= scale
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_unipolar_tiled_kernel(
-    cum_ptr,           # (D, stoc_len+1, V) int16
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (D, N) int16 — transposed for coalesced access
-    boundary_b_ptr,    # (D, M) int16 — transposed for coalesced access
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """
-    Tiled enable-signal matmul (unipolar).
+    """Tiled enable-signal matmul.
 
     BLOCK_K tiles the D dimension with static_range for compiler unrolling.
-    Boundary tensors use (D, N) layout for coalesced thread access.
+    Boundary/sign tensors use (D, N) layout for coalesced thread access.
+    ``IS_BIPOLAR`` selects sign-magnitude (loads sa/sb, with all-zero skip)
+    vs asymmetric (no sign loads). Sign pointers are only read when
+    ``IS_BIPOLAR`` is True; pass any valid dummy tensor in the unipolar path.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -266,19 +196,33 @@ def enable_matmul_unipolar_tiled_kernel(
         for ki in tl.static_range(BLOCK_K):
             d = k_start + ki
             if d < D:
-                ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-                bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                if IS_BIPOLAR:
+                    # Bipolar fast path: sign load + early skip on all-zero rows/cols.
+                    sa_i8 = tl.load(sign_a_ptr + d * N + m_offsets, mask=m_mask, other=0)
+                    if tl.sum(tl.abs(sa_i8).to(tl.int32)) > 0:
+                        sb_i8 = tl.load(sign_b_ptr + d * M + n_offsets, mask=n_mask, other=0)
+                        if tl.sum(tl.abs(sb_i8).to(tl.int32)) > 0:
+                            sa = sa_i8.to(tl.float32)
+                            sb = sb_i8.to(tl.float32)
+                            ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
+                            bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                            k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                            cum_offsets = (d * cum_stride_d
+                                           + k_vals[:, None].to(tl.int64) * V
+                                           + bb[None, :].to(tl.int64))
+                            counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
+                            acc += counts * sa[:, None] * sb[None, :]
+                else:
+                    ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
+                    bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                    k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                    cum_offsets = (d * cum_stride_d
+                                   + k_vals[:, None].to(tl.int64) * V
+                                   + bb[None, :].to(tl.int64))
+                    counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
+                    acc += counts
 
-                k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-                cum_offsets = (d * cum_stride_d
-                               + k_vals[:, None].to(tl.int64) * V
-                               + bb[None, :].to(tl.int64))
-                counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
-
-                acc += counts
-
-    # Apply loop-invariant scale once
+    # Apply loop-invariant scale once (enables FMA fusion in the inner loop)
     acc *= scale
 
     out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
@@ -302,13 +246,13 @@ def enable_matmul_unipolar_tiled_kernel(
 # =============================================================================
 
 @triton.jit
-def enable_matmul_compact_bipolar_dot_kernel(
+def enable_matmul_compact_dot_kernel(
     rng_b_ptr,         # (D, stoc_len) int32
     k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int16
-    boundary_b_ptr,    # (M, D) int16
-    sign_a_ptr,        # (N, D) int8
-    sign_b_ptr,        # (M, D) int8
+    boundary_a_ptr,    # (N, D) int16 (bipolar) or int32 (unipolar)
+    boundary_b_ptr,    # (M, D) int16 (bipolar) or int32 (unipolar)
+    sign_a_ptr,        # (N, D) int8 — only read when IS_BIPOLAR
+    sign_b_ptr,        # (M, D) int8 — only read when IS_BIPOLAR
     output_ptr,        # (N, M) float32
     N, M, D,
     stoc_len: tl.constexpr,
@@ -317,66 +261,15 @@ def enable_matmul_compact_bipolar_dot_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BATCH_T: tl.constexpr,
+    IS_BIPOLAR: tl.constexpr,
 ):
-    """
-    Compact enable-signal matmul (bipolar). tl.dot vectorized, no split-D.
+    """Compact enable-signal matmul. tl.dot vectorized, no split-D.
+
     For small D (attention). Inputs in (N, D) / (M, D) row-major layout.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    num_batches: tl.constexpr = stoc_len // BATCH_T
-
-    for d in range(D):
-        ba = tl.load(boundary_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.int32)
-        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-        sa = tl.load(sign_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.float32)
-        sb = tl.load(sign_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.float32)
-
-        counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-        for tb in range(num_batches):
-            t_base = tb * BATCH_T
-            t_indices = t_base + tl.arange(0, BATCH_T)
-            rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)
-            t_ok = (t_indices[None, :] < k_vals[:, None]).to(tl.int8)
-            r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
-            counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
-
-        acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_compact_unipolar_dot_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int32
-    boundary_b_ptr,    # (M, D) int32
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul (unipolar). tl.dot vectorized, no split-D.
-    For small D (attention). Inputs in (N, D) / (M, D) row-major layout.
+    ``IS_BIPOLAR`` selects sign-magnitude (bipolar, multiplies by sa*sb) vs
+    asymmetric (unipolar, no sign multiplication). Sign pointers are loaded
+    only when ``IS_BIPOLAR`` is True; pass any valid dummy tensor for them
+    in the unipolar call path.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -405,7 +298,12 @@ def enable_matmul_compact_unipolar_dot_kernel(
             r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
             counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
 
-        acc += counts.to(tl.float32) * scale
+        if IS_BIPOLAR:
+            sa = tl.load(sign_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.float32)
+            sb = tl.load(sign_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.float32)
+            acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
+        else:
+            acc += counts.to(tl.float32) * scale
 
     out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -1248,25 +1146,19 @@ def enable_matmul_triton(
     # Warp count tuning: more warps for larger tiles, fewer for smaller
     nw = 8 if BLOCK_M == 32 else 2
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
-    if is_bipolar:
-        enable_matmul_bipolar_tiled_kernel[grid](
-            cum_indicator, k_table,
-            boundary_a, boundary_b,
-            sign_a, sign_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-            num_warps=nw,
-        )
-    else:
-        enable_matmul_unipolar_tiled_kernel[grid](
-            cum_indicator, k_table,
-            boundary_a, boundary_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-            num_warps=nw,
-        )
+    if not is_bipolar:
+        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
+        sign_a = sign_b = _dummy_sign
+    enable_matmul_tiled_kernel[grid](
+        cum_indicator, k_table,
+        boundary_a, boundary_b,
+        sign_a, sign_b,
+        output,
+        N, M, D, stoc_len, V,
+        q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+        IS_BIPOLAR=is_bipolar,
+        num_warps=nw,
+    )
 
     return output
 
@@ -1337,23 +1229,20 @@ def enable_matmul_compact(
     BLOCK_N = 32
     BATCH_T = 32
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
-    if is_bipolar:
-        enable_matmul_compact_bipolar_dot_kernel[grid](
-            rng_b, k_table,
-            boundary_a, boundary_b,
-            sign_a, sign_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
-        )
-    else:
-        enable_matmul_compact_unipolar_dot_kernel[grid](
-            rng_b, k_table,
-            boundary_a, boundary_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
-        )
+    # Unipolar path doesn't read sign pointers (constexpr-branched out).
+    # Pass dummy 1-element int8 tensors; they're never dereferenced inside.
+    if not is_bipolar:
+        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
+        sign_a = sign_b = _dummy_sign
+    enable_matmul_compact_dot_kernel[grid](
+        rng_b, k_table,
+        boundary_a, boundary_b,
+        sign_a, sign_b,
+        output,
+        N, M, D, stoc_len, V,
+        q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
+        IS_BIPOLAR=is_bipolar,
+    )
 
     return output
 
@@ -1439,24 +1328,18 @@ def enable_matmul_compact_mlp(
         if is_bipolar:
             sa_chunk = sign_a[:, d_start:d_end].t().contiguous()
             sb_chunk = sign_b[:, d_start:d_end].t().contiguous()
-            enable_matmul_bipolar_tiled_kernel[grid_mm](
-                cum_chunk, k_tab_chunk,
-                ba_chunk, bb_chunk,
-                sa_chunk, sb_chunk,
-                partial,
-                N, M, d_len, stoc_len, V,
-                q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-                num_warps=nw,
-            )
         else:
-            enable_matmul_unipolar_tiled_kernel[grid_mm](
-                cum_chunk, k_tab_chunk,
-                ba_chunk, bb_chunk,
-                partial,
-                N, M, d_len, stoc_len, V,
-                q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-                num_warps=nw,
-            )
+            sa_chunk = sb_chunk = torch.empty(1, dtype=torch.int8, device=partial.device)
+        enable_matmul_tiled_kernel[grid_mm](
+            cum_chunk, k_tab_chunk,
+            ba_chunk, bb_chunk,
+            sa_chunk, sb_chunk,
+            partial,
+            N, M, d_len, stoc_len, V,
+            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+            IS_BIPOLAR=is_bipolar,
+            num_warps=nw,
+        )
 
         output += partial
 
@@ -1806,13 +1689,14 @@ def _sc_matmul_bipolar_mlp_chunked(
         sign_b_t = sign_b.t().contiguous()
 
         # Fast tiled matmul with O(1) cum_indicator lookup
-        enable_matmul_bipolar_tiled_kernel[grid_mm](
+        enable_matmul_tiled_kernel[grid_mm](
             cum_chunk, k_tab_chunk,
             boundary_a_t, boundary_b_t,
             sign_a_t, sign_b_t,
             partial,
             N, M, d_len, stoc_len, V,
             q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+            IS_BIPOLAR=True,
             num_warps=nw,
         )
 
