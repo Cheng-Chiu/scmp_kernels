@@ -1,40 +1,27 @@
 """Stochastic-computing kernels.
 
-Two parallel public APIs:
+Public surface:
 
-1. **Granularity dispatcher** — ``sc_matmul(a, b, granularity=..., ...)``
-   from ``matmul.py``. Recommended for new callers.
-
-2. **Flat-API compatibility surface** — explicit ``sc_matmul_*`` names
-   matching the historical ``sc_triton`` module. Used by application code
-   (Q-DiT and similar) that imports specific specialized functions.
+* ``sc_matmul`` — unified granularity-dispatcher. Accepts
+  ``granularity={"per_tensor","per_row","per_head"}`` plus orthogonal
+  knobs (``mode``, ``sc_prec``, ``stoc_len``, ``chunk_d``,
+  ``group_a``/``group_b``, ``rng_levels``, ``config``). All historical
+  specialized entry points (per-tensor, per-row, per-row-MLP,
+  per-row-grouped, per-head-bipolar) are reachable through this single
+  function.
+* ``clear_rng_cache`` — drop cached RNG sequences (call after changing
+  Sobol/Owen env vars or rotating seeds).
+* ``det_kernel_tuning`` — context manager opting in to det-tuned tile
+  sizes on the batched grouped path.
 
 All inputs/outputs are float32; quantization happens inside the Triton kernels.
 """
 
 from .matmul import sc_matmul
-
-from .kernels import (
-    det_kernel_tuning,
-    clear_rng_cache,
-    sc_matmul_per_tensor,
-    sc_matmul_mlp,
-    sc_matmul_grouped,
-    sc_matmul_enable_triton,
-    sc_matmul_enable_triton_mlp,
-    sc_matmul_grouped_enable_triton,
-    sc_matmul_enable_batched_bipolar,
-)
+from .kernels import clear_rng_cache, det_kernel_tuning
 
 __all__ = [
     "sc_matmul",
-    "det_kernel_tuning",
     "clear_rng_cache",
-    "sc_matmul_per_tensor",
-    "sc_matmul_mlp",
-    "sc_matmul_grouped",
-    "sc_matmul_enable_triton",
-    "sc_matmul_enable_triton_mlp",
-    "sc_matmul_grouped_enable_triton",
-    "sc_matmul_enable_batched_bipolar",
+    "det_kernel_tuning",
 ]
