@@ -147,105 +147,18 @@ def compute_k_table_kernel(
     tl.store(k_table_ptr + d * V + v_range, counts)
 
 
-@triton.jit
-def enable_matmul_bipolar_kernel(
-    cum_ptr,           # (D, stoc_len+1, V) int16
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int16
-    boundary_b_ptr,    # (M, D) int16
-    sign_a_ptr,        # (N, D) int8
-    sign_b_ptr,        # (M, D) int8
-    output_ptr,        # (N, M) float32
-    N: tl.constexpr,
-    M: tl.constexpr,
-    D: tl.constexpr,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,          # float: q_max^2 for decoding
-):
-    """
-    Enable-signal matmul kernel (bipolar sign-magnitude).
-
-    Each program computes output[n, m] = sum_d decode(enable_count[n,m,d]) * sign_a * sign_b
-    """
-    n = tl.program_id(0)
-    m = tl.program_id(1)
-    if n >= N or m >= M:
-        return
-
-    cum_stride_d = (stoc_len + 1) * V
-    dot_product = 0.0
-
-    for d in tl.static_range(D):
-        ba = tl.load(boundary_a_ptr + n * D + d).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + m * D + d).to(tl.int32)
-
-        # k = k_table[d, ba]
-        k = tl.load(k_table_ptr + d * V + ba).to(tl.int32)
-
-        # count = cum_indicator[d, k, bb]
-        count = tl.load(cum_ptr + d * cum_stride_d + k * V + bb).to(tl.float32)
-
-        # Decode and apply signs
-        decoded = count * q_max_sq / stoc_len
-        sa = tl.load(sign_a_ptr + n * D + d).to(tl.float32)
-        sb = tl.load(sign_b_ptr + m * D + d).to(tl.float32)
-        dot_product += decoded * sa * sb
-
-    tl.store(output_ptr + n * M + m, dot_product)
-
-
-@triton.jit
-def enable_matmul_unipolar_kernel(
-    cum_ptr,           # (D, stoc_len+1, V) int16
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int32
-    boundary_b_ptr,    # (M, D) int32
-    output_ptr,        # (N, M) float32
-    N: tl.constexpr,
-    M: tl.constexpr,
-    D: tl.constexpr,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,          # float: q_max^2 for decoding
-):
-    """
-    Enable-signal matmul kernel (unipolar).
-
-    Each program computes output[n, m] = sum_d decode(enable_count[n,m,d])
-    """
-    n = tl.program_id(0)
-    m = tl.program_id(1)
-    if n >= N or m >= M:
-        return
-
-    cum_stride_d = (stoc_len + 1) * V
-    dot_product = 0.0
-
-    for d in tl.static_range(D):
-        ba = tl.load(boundary_a_ptr + n * D + d).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + m * D + d).to(tl.int32)
-
-        k = tl.load(k_table_ptr + d * V + ba).to(tl.int32)
-        count = tl.load(cum_ptr + d * cum_stride_d + k * V + bb).to(tl.float32)
-
-        dot_product += count * q_max_sq / stoc_len
-
-    tl.store(output_ptr + n * M + m, dot_product)
-
-
 # =============================================================================
 # Enable-Signal Tiled Kernels
 # =============================================================================
 
 @triton.jit
-def enable_matmul_bipolar_tiled_kernel(
+def enable_matmul_tiled_kernel(
     cum_ptr,           # (D, stoc_len+1, V) int16
     k_table_ptr,       # (D, V) int16
     boundary_a_ptr,    # (D, N) int16 — transposed for coalesced access
     boundary_b_ptr,    # (D, M) int16 — transposed for coalesced access
-    sign_a_ptr,        # (D, N) int8 — transposed for coalesced access
-    sign_b_ptr,        # (D, M) int8 — transposed for coalesced access
+    sign_a_ptr,        # (D, N) int8 — only read when IS_BIPOLAR
+    sign_b_ptr,        # (D, M) int8 — only read when IS_BIPOLAR
     output_ptr,        # (N, M) float32
     N, M, D,
     stoc_len: tl.constexpr,
@@ -254,85 +167,15 @@ def enable_matmul_bipolar_tiled_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    IS_BIPOLAR: tl.constexpr,
 ):
-    """
-    Tiled enable-signal matmul (bipolar sign-magnitude).
-
-    BLOCK_K tiles the D dimension with static_range for compiler unrolling,
-    allowing better instruction scheduling and memory access pipelining.
-    Boundary/sign tensors use (D, N) layout for coalesced thread access.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-    gather_mask = m_mask[:, None] & n_mask[None, :]
-
-    cum_stride_d = (stoc_len + 1) * V
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    num_k_blocks = (D + BLOCK_K - 1) // BLOCK_K
-    for k_block in range(num_k_blocks):
-        k_start = k_block * BLOCK_K
-        for ki in tl.static_range(BLOCK_K):
-            d = k_start + ki
-            if d < D:
-                # Load signs as int8, cast for zero-check and arithmetic
-                sa_i8 = tl.load(sign_a_ptr + d * N + m_offsets, mask=m_mask, other=0)
-                # Skip if all sign_a are zero — no contribution to acc
-                if tl.sum(tl.abs(sa_i8).to(tl.int32)) > 0:
-                    sb_i8 = tl.load(sign_b_ptr + d * M + n_offsets, mask=n_mask, other=0)
-                    # Skip if all sign_b are zero
-                    if tl.sum(tl.abs(sb_i8).to(tl.int32)) > 0:
-                        sa = sa_i8.to(tl.float32)
-                        sb = sb_i8.to(tl.float32)
-                        # Load boundaries (coalesced — (D,N) layout)
-                        ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-                        bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-
-                        # k_table lookup: k[d, ba] -> [BLOCK_M]
-                        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-                        # cum_indicator gather: cum[d, k_vals[i], bb[j]] -> [BLOCK_M, BLOCK_N]
-                        cum_offsets = (d * cum_stride_d
-                                       + k_vals[:, None].to(tl.int64) * V
-                                       + bb[None, :].to(tl.int64))
-                        counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
-
-                        acc += counts * sa[:, None] * sb[None, :]
-
-    # Apply loop-invariant scale once (enables FMA fusion in the inner loop)
-    acc *= scale
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_unipolar_tiled_kernel(
-    cum_ptr,           # (D, stoc_len+1, V) int16
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (D, N) int16 — transposed for coalesced access
-    boundary_b_ptr,    # (D, M) int16 — transposed for coalesced access
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-):
-    """
-    Tiled enable-signal matmul (unipolar).
+    """Tiled enable-signal matmul.
 
     BLOCK_K tiles the D dimension with static_range for compiler unrolling.
-    Boundary tensors use (D, N) layout for coalesced thread access.
+    Boundary/sign tensors use (D, N) layout for coalesced thread access.
+    ``IS_BIPOLAR`` selects sign-magnitude (loads sa/sb, with all-zero skip)
+    vs asymmetric (no sign loads). Sign pointers are only read when
+    ``IS_BIPOLAR`` is True; pass any valid dummy tensor in the unipolar path.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -353,19 +196,33 @@ def enable_matmul_unipolar_tiled_kernel(
         for ki in tl.static_range(BLOCK_K):
             d = k_start + ki
             if d < D:
-                ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-                bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                if IS_BIPOLAR:
+                    # Bipolar fast path: sign load + early skip on all-zero rows/cols.
+                    sa_i8 = tl.load(sign_a_ptr + d * N + m_offsets, mask=m_mask, other=0)
+                    if tl.sum(tl.abs(sa_i8).to(tl.int32)) > 0:
+                        sb_i8 = tl.load(sign_b_ptr + d * M + n_offsets, mask=n_mask, other=0)
+                        if tl.sum(tl.abs(sb_i8).to(tl.int32)) > 0:
+                            sa = sa_i8.to(tl.float32)
+                            sb = sb_i8.to(tl.float32)
+                            ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
+                            bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                            k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                            cum_offsets = (d * cum_stride_d
+                                           + k_vals[:, None].to(tl.int64) * V
+                                           + bb[None, :].to(tl.int64))
+                            counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
+                            acc += counts * sa[:, None] * sb[None, :]
+                else:
+                    ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
+                    bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
+                    k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
+                    cum_offsets = (d * cum_stride_d
+                                   + k_vals[:, None].to(tl.int64) * V
+                                   + bb[None, :].to(tl.int64))
+                    counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
+                    acc += counts
 
-                k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-                cum_offsets = (d * cum_stride_d
-                               + k_vals[:, None].to(tl.int64) * V
-                               + bb[None, :].to(tl.int64))
-                counts = tl.load(cum_ptr + cum_offsets, mask=gather_mask, other=0).to(tl.float32)
-
-                acc += counts
-
-    # Apply loop-invariant scale once
+    # Apply loop-invariant scale once (enables FMA fusion in the inner loop)
     acc *= scale
 
     out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
@@ -376,147 +233,6 @@ def enable_matmul_unipolar_tiled_kernel(
 # =============================================================================
 # Enable-Signal Compact Kernels (no cum_indicator table, O(D*V) memory)
 # =============================================================================
-
-@triton.jit
-def enable_matmul_compact_bipolar_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int16
-    boundary_b_ptr,    # (M, D) int16
-    sign_a_ptr,        # (N, D) int8
-    sign_b_ptr,        # (M, D) int8
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul (bipolar). Computes cum_indicator on-the-fly.
-
-    For each (n, m, d): count = |{t < k : rng_b[d, t] <= bb}|
-    where k = k_table[d, ba], ba = boundary_a[n, d], bb = boundary_b[m, d].
-
-    BATCH_T vectorizes the inner t-loop: loads BATCH_T RNG values at once and
-    compares them against bb in a vectorized manner, reducing loop iterations
-    from stoc_len to stoc_len/BATCH_T.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for d in range(D):
-        # Load boundaries
-        ba = tl.load(boundary_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.int32)
-
-        # k = k_table[d, ba] -> [BLOCK_M]
-        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-        # Batch-vectorized inner loop: load BATCH_T RNG values at once
-        counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-        num_batches = stoc_len // BATCH_T
-        for tb in range(num_batches):
-            t_base = tb * BATCH_T
-            t_indices = t_base + tl.arange(0, BATCH_T)  # [BATCH_T]
-
-            # Load BATCH_T RNG values: rng_b[d, t_base:t_base+BATCH_T]
-            rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)  # [BATCH_T]
-
-            # t_mask: which t indices are < k_vals[m]? -> [BLOCK_M, BATCH_T]
-            t_ok = t_indices[None, :] < k_vals[:, None]  # [BLOCK_M, BATCH_T]
-
-            # r_mask: which rng vals are <= bb[n]? -> [BATCH_T, BLOCK_N]
-            r_ok = bb[None, :] > rng_vals[:, None]  # [BATCH_T, BLOCK_N]
-
-            # For each (m, n): sum over BATCH_T where both conditions hold
-            # t_ok: [BLOCK_M, BATCH_T], r_ok: [BATCH_T, BLOCK_N]
-            # We need: counts[m, n] += sum_t(t_ok[m, t] & r_ok[t, n])
-            # Compute by iterating over BATCH_T (static_range for unrolling)
-            for ti in tl.static_range(BATCH_T):
-                t_m = t_ok[:, ti]   # [BLOCK_M] bool
-                r_n = r_ok[ti, :]   # [BLOCK_N] bool
-                counts += (t_m[:, None] & r_n[None, :]).to(tl.int32)
-
-        # Signs (int8 → float32)
-        sa = tl.load(sign_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.float32)
-        sb = tl.load(sign_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.float32)
-
-        acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_compact_unipolar_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int32
-    boundary_b_ptr,    # (M, D) int32
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul (unipolar). No cum_indicator table needed.
-
-    BATCH_T vectorizes the inner t-loop for reduced iteration count.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    for d in range(D):
-        ba = tl.load(boundary_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.int32)
-        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-        counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-        num_batches = stoc_len // BATCH_T
-        for tb in range(num_batches):
-            t_base = tb * BATCH_T
-            t_indices = t_base + tl.arange(0, BATCH_T)
-
-            rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)
-
-            t_ok = t_indices[None, :] < k_vals[:, None]
-            r_ok = bb[None, :] > rng_vals[:, None]
-
-            for ti in tl.static_range(BATCH_T):
-                t_m = t_ok[:, ti]
-                r_n = r_ok[ti, :]
-                counts += (t_m[:, None] & r_n[None, :]).to(tl.int32)
-
-        acc += counts.to(tl.float32) * scale
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
 
 # =============================================================================
 # Enable-Signal Compact Kernels for MLP
@@ -530,13 +246,13 @@ def enable_matmul_compact_unipolar_kernel(
 # =============================================================================
 
 @triton.jit
-def enable_matmul_compact_bipolar_dot_kernel(
+def enable_matmul_compact_dot_kernel(
     rng_b_ptr,         # (D, stoc_len) int32
     k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int16
-    boundary_b_ptr,    # (M, D) int16
-    sign_a_ptr,        # (N, D) int8
-    sign_b_ptr,        # (M, D) int8
+    boundary_a_ptr,    # (N, D) int16 (bipolar) or int32 (unipolar)
+    boundary_b_ptr,    # (M, D) int16 (bipolar) or int32 (unipolar)
+    sign_a_ptr,        # (N, D) int8 — only read when IS_BIPOLAR
+    sign_b_ptr,        # (M, D) int8 — only read when IS_BIPOLAR
     output_ptr,        # (N, M) float32
     N, M, D,
     stoc_len: tl.constexpr,
@@ -545,66 +261,15 @@ def enable_matmul_compact_bipolar_dot_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BATCH_T: tl.constexpr,
+    IS_BIPOLAR: tl.constexpr,
 ):
-    """
-    Compact enable-signal matmul (bipolar). tl.dot vectorized, no split-D.
+    """Compact enable-signal matmul. tl.dot vectorized, no split-D.
+
     For small D (attention). Inputs in (N, D) / (M, D) row-major layout.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    num_batches: tl.constexpr = stoc_len // BATCH_T
-
-    for d in range(D):
-        ba = tl.load(boundary_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.int32)
-        bb = tl.load(boundary_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.int32)
-        k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-        sa = tl.load(sign_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.float32)
-        sb = tl.load(sign_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.float32)
-
-        counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-        for tb in range(num_batches):
-            t_base = tb * BATCH_T
-            t_indices = t_base + tl.arange(0, BATCH_T)
-            rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)
-            t_ok = (t_indices[None, :] < k_vals[:, None]).to(tl.int8)
-            r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
-            counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
-
-        acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.store(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_compact_unipolar_dot_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (N, D) int32
-    boundary_b_ptr,    # (M, D) int32
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul (unipolar). tl.dot vectorized, no split-D.
-    For small D (attention). Inputs in (N, D) / (M, D) row-major layout.
+    ``IS_BIPOLAR`` selects sign-magnitude (bipolar, multiplies by sa*sb) vs
+    asymmetric (unipolar, no sign multiplication). Sign pointers are loaded
+    only when ``IS_BIPOLAR`` is True; pass any valid dummy tensor for them
+    in the unipolar call path.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -633,7 +298,12 @@ def enable_matmul_compact_unipolar_dot_kernel(
             r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
             counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
 
-        acc += counts.to(tl.float32) * scale
+        if IS_BIPOLAR:
+            sa = tl.load(sign_a_ptr + m_offsets * D + d, mask=m_mask, other=0).to(tl.float32)
+            sb = tl.load(sign_b_ptr + n_offsets * D + d, mask=n_mask, other=0).to(tl.float32)
+            acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
+        else:
+            acc += counts.to(tl.float32) * scale
 
     out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
     out_mask = m_mask[:, None] & n_mask[None, :]
@@ -642,131 +312,6 @@ def enable_matmul_compact_unipolar_dot_kernel(
 
 # --- Split-D kernels for MLP (transposed inputs, atomic accumulation) ---
 
-@triton.jit
-def enable_matmul_compact_bipolar_mlp_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (D, N) int16  -- TRANSPOSED for coalesced access
-    boundary_b_ptr,    # (D, M) int16  -- TRANSPOSED
-    sign_a_ptr,        # (D, N) int8 -- TRANSPOSED
-    sign_b_ptr,        # (D, M) int8 -- TRANSPOSED
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul for MLP (bipolar). Split-D + tl.dot.
-
-    - Inputs transposed to (D, N)/(D, M) for coalesced memory access.
-    - Grid z-axis splits D into BLOCK_D chunks for parallelism.
-    - Uses tl.atomic_add for cross-chunk accumulation.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_d = tl.program_id(2)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    d_start = pid_d * BLOCK_D
-    num_batches: tl.constexpr = stoc_len // BATCH_T
-
-    for d_off in range(BLOCK_D):
-        d = d_start + d_off
-        if d < D:
-            # Coalesced loads: (D, N) layout, load row d, columns m_offsets
-            ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-            bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-            k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-            sa = tl.load(sign_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.float32)
-            sb = tl.load(sign_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.float32)
-
-            counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-            for tb in range(num_batches):
-                t_base = tb * BATCH_T
-                t_indices = t_base + tl.arange(0, BATCH_T)
-                rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)
-                t_ok = (t_indices[None, :] < k_vals[:, None]).to(tl.int8)
-                r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
-                counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
-
-            acc += counts.to(tl.float32) * scale * sa[:, None] * sb[None, :]
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.atomic_add(output_ptr + out_offsets, acc, mask=out_mask)
-
-
-@triton.jit
-def enable_matmul_compact_unipolar_mlp_kernel(
-    rng_b_ptr,         # (D, stoc_len) int32
-    k_table_ptr,       # (D, V) int16
-    boundary_a_ptr,    # (D, N) int32  -- TRANSPOSED
-    boundary_b_ptr,    # (D, M) int32  -- TRANSPOSED
-    output_ptr,        # (N, M) float32
-    N, M, D,
-    stoc_len: tl.constexpr,
-    V: tl.constexpr,
-    q_max_sq,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BATCH_T: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    """
-    Compact enable-signal matmul for MLP (unipolar). Split-D + tl.dot.
-    Transposed inputs for coalesced access, atomic accumulation.
-    """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
-    pid_d = tl.program_id(2)
-
-    m_offsets = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    n_offsets = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    m_mask = m_offsets < N
-    n_mask = n_offsets < M
-
-    scale = q_max_sq / stoc_len
-    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-
-    d_start = pid_d * BLOCK_D
-    num_batches: tl.constexpr = stoc_len // BATCH_T
-
-    for d_off in range(BLOCK_D):
-        d = d_start + d_off
-        if d < D:
-            ba = tl.load(boundary_a_ptr + d * N + m_offsets, mask=m_mask, other=0).to(tl.int32)
-            bb = tl.load(boundary_b_ptr + d * M + n_offsets, mask=n_mask, other=0).to(tl.int32)
-            k_vals = tl.load(k_table_ptr + d * V + ba, mask=m_mask, other=0).to(tl.int32)
-
-            counts = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
-            for tb in range(num_batches):
-                t_base = tb * BATCH_T
-                t_indices = t_base + tl.arange(0, BATCH_T)
-                rng_vals = tl.load(rng_b_ptr + d * stoc_len + t_indices)
-                t_ok = (t_indices[None, :] < k_vals[:, None]).to(tl.int8)
-                r_ok = (bb[None, :] > rng_vals[:, None]).to(tl.int8)
-                counts += tl.dot(t_ok, r_ok, out_dtype=tl.int32)
-
-            acc += counts.to(tl.float32) * scale
-
-    out_offsets = m_offsets[:, None] * M + n_offsets[None, :]
-    out_mask = m_mask[:, None] & n_mask[None, :]
-    tl.atomic_add(output_ptr + out_offsets, acc, mask=out_mask)
-
-
 # =============================================================================
 # Fused Quantization Kernels
 # Replaces scattered PyTorch elementwise ops (div, round, clamp, sign, abs,
@@ -774,105 +319,97 @@ def enable_matmul_compact_unipolar_mlp_kernel(
 # =============================================================================
 
 @triton.jit
-def fused_quant_bipolar_kernel(
+def fused_quant_kernel(
     fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int16 output
-    sign_ptr,          # (rows, cols) int8 output
-    inv_scale,         # float: 1.0 / scale = q_norm / abs_max
-    q_clip,            # int: clamp upper bound (e.g. 125 for 8-bit)
-    q_clip_min,        # int: clamp lower bound (e.g. -125 for 8-bit)
-    q_norm,            # int: normalization q_max for boundary (e.g. 127)
-    max_rng_val,       # int: 2^sc_prec - 1
+    boundary_ptr,      # (rows, cols) int16 (bipolar) or int32 (unipolar) output
+    sign_ptr,          # (rows, cols) int8 — only written when IS_BIPOLAR
+    scale_ptr,         # (rows,) float32 — only written when PER_ROW and IS_BIPOLAR
+    row_sum_ptr,       # (rows,) float32 — only written when PER_ROW and not IS_BIPOLAR
+    inv_scale,         # float scalar — ignored when PER_ROW and IS_BIPOLAR (computed on-device)
+    zp,                # float scalar — only used when not IS_BIPOLAR
+    q_max,             # int: symmetric bound (bipolar) or asymmetric upper (unipolar)
+    max_rng_val,       # int: 2^sc_prec
     rows, cols,
-    BLOCK: tl.constexpr,
+    BLOCK: tl.constexpr,   # = BLOCK (flat path) or COLS_PAD (per-row path)
+    IS_BIPOLAR: tl.constexpr,
+    PER_ROW: tl.constexpr,
 ):
+    """Unified fused quant kernel covering 4 (mode × layout) variants.
+
+    Compile-time variants (caller picks via constexpr flags + grid shape):
+      • flat   + bipolar  → host inv_scale, writes (boundary int16, sign int8)
+      • per_row + bipolar → on-device scale, writes (boundary int16, sign int8, scale)
+      • flat   + unipolar → host inv_scale + zp, writes boundary int32
+      • per_row + unipolar → host inv_scale + zp, writes (boundary int32, row_sum)
+
+    Grid:
+      PER_ROW=True  → (rows,)                  BLOCK = COLS_PAD = next_power_of_2(cols)
+      PER_ROW=False → (cdiv(rows*cols, BLOCK),) BLOCK = 1024 (or chosen)
     """
-    Fused bipolar quantization: FP -> (boundary, sign) in one kernel.
+    q_max_f = q_max.to(tl.float32)
 
-    For each element x:
-      x_int = round(clamp(x * inv_scale, q_clip_min, q_clip))
-      sign = int8(sign(x_int))  (-1, 0, or 1)
-      boundary = int16(abs(x_int) * max_rng_val / q_norm)
-    """
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    total = rows * cols
-    mask = offsets < total
+    if PER_ROW:
+        row = tl.program_id(0)
+        if row >= rows:
+            return
+        col_offsets = tl.arange(0, BLOCK)
+        mask = col_offsets < cols
+        base = row * cols
+        x = tl.load(fp_ptr + base + col_offsets, mask=mask, other=0.0)
 
-    x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
+        if IS_BIPOLAR:
+            # Per-row symmetric: compute scale on-device, write it.
+            abs_max = tl.max(tl.abs(x))
+            abs_max = tl.maximum(abs_max, 1e-5)
+            scale = abs_max / q_max
+            inv_scale_local = 1.0 / scale
+            tl.store(scale_ptr + row, scale)
+            x_scaled = x * inv_scale_local
+        else:
+            # Per-row unipolar: host-provided scale + zp, write row_sum for zp correction.
+            x_scaled = x * inv_scale + zp
+    else:
+        pid = tl.program_id(0)
+        offsets = pid * BLOCK + tl.arange(0, BLOCK)
+        total = rows * cols
+        mask = offsets < total
+        base = 0  # offsets already absolute
+        col_offsets = offsets
+        x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
+        if IS_BIPOLAR:
+            x_scaled = x * inv_scale
+        else:
+            x_scaled = x * inv_scale + zp
 
-    # Quantize: x_int = round(clamp(x * inv_scale, q_clip_min, q_clip))
-    x_scaled = x * inv_scale
-    # round
     x_rounded = libdevice.nearbyint(x_scaled)
-    # clamp to [-q_clip, q_clip] (narrower than full range to avoid degenerate SC probs)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, q_clip_min.to(tl.float32)), q_clip.to(tl.float32))
 
-    # Sign: -1, 0, or +1 as int8
-    sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
-                        tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
-                                 tl.full(x_clamped.shape, 0, dtype=tl.int8)))
+    if IS_BIPOLAR:
+        x_clamped = tl.minimum(tl.maximum(x_rounded, -q_max_f), q_max_f)
+        sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
+                            tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
+                                     tl.full(x_clamped.shape, 0, dtype=tl.int8)))
+        mag = tl.abs(x_clamped)
+        boundary = libdevice.nearbyint(mag * (max_rng_val / q_max)).to(tl.int16)
+        if PER_ROW:
+            tl.store(boundary_ptr + base + col_offsets, boundary, mask=mask)
+            tl.store(sign_ptr + base + col_offsets, sign_val, mask=mask)
+        else:
+            tl.store(boundary_ptr + col_offsets, boundary, mask=mask)
+            tl.store(sign_ptr + col_offsets, sign_val, mask=mask)
+    else:
+        x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max_f)
+        boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
+        if PER_ROW:
+            tl.store(boundary_ptr + base + col_offsets, boundary, mask=mask)
+            row_sum = tl.sum(x_clamped, axis=0)
+            tl.store(row_sum_ptr + row, row_sum)
+        else:
+            tl.store(boundary_ptr + col_offsets, boundary, mask=mask)
 
-    # Boundary: abs(x_int) * max_rng_val / q_norm (q_norm=127, not q_clip)
-    mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_norm)).to(tl.int16)
 
-    tl.store(boundary_ptr + offsets, boundary, mask=mask)
-    tl.store(sign_ptr + offsets, sign_val, mask=mask)
-
-
-@triton.jit
-def fused_quant_bipolar_perrow_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int16 output
-    sign_ptr,          # (rows, cols) int8 output
-    scale_ptr,         # (rows,) float32 output — per-row scale for dequant
-    q_clip,            # int: clamp bound (e.g. 125)
-    q_norm,            # int: normalization for boundary (e.g. 127)
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    COLS_PAD: tl.constexpr,
-):
-    """
-    Fused per-row bipolar quantization: FP -> (boundary, sign, scale) in one
-    kernel launch. One program per row.
-
-    Replaces _grouped_symmetric_quant + boundary computation (~20+ PyTorch ops)
-    with a single Triton kernel.
-    """
-    row = tl.program_id(0)
-    if row >= rows:
-        return
-
-    col_offsets = tl.arange(0, COLS_PAD)
-    mask = col_offsets < cols
-
-    # Load entire row
-    x = tl.load(fp_ptr + row * cols + col_offsets, mask=mask, other=0.0)
-
-    # Per-row abs max → scale
-    abs_max = tl.max(tl.abs(x))
-    abs_max = tl.maximum(abs_max, 1e-5)
-    scale = abs_max / q_clip
-    inv_scale = 1.0 / scale
-    tl.store(scale_ptr + row, scale)
-
-    # Quantize: round(clamp(x / scale, -q_clip, q_clip))
-    x_scaled = x * inv_scale
-    x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, (-q_clip).to(tl.float32)), q_clip.to(tl.float32))
-
-    # Sign: -1, 0, +1 as int8
-    sign_val = tl.where(x_clamped > 0.0, tl.full(x_clamped.shape, 1, dtype=tl.int8),
-                        tl.where(x_clamped < 0.0, tl.full(x_clamped.shape, -1, dtype=tl.int8),
-                                 tl.full(x_clamped.shape, 0, dtype=tl.int8)))
-
-    # Boundary: round(|x_int| * max_rng_val / q_norm)
-    mag = tl.abs(x_clamped)
-    boundary = libdevice.nearbyint(mag * (max_rng_val / q_norm)).to(tl.int16)
-
-    tl.store(boundary_ptr + row * cols + col_offsets, boundary, mask=mask)
-    tl.store(sign_ptr + row * cols + col_offsets, sign_val, mask=mask)
+# A single 1-element dummy tensor we can pass for unused output pointers.
+def _quant_dummy(device):
+    return torch.empty(1, dtype=torch.int8, device=device)
 
 
 def fused_quantize_bipolar_perrow(
@@ -880,110 +417,27 @@ def fused_quantize_bipolar_perrow(
     sc_prec: int,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Fused per-row bipolar quantization in one kernel launch.
+    """Fused per-row bipolar quantization.
 
-    Matches _grouped_symmetric_quant(x, G=1, q_max, clip_margin=0) followed by
-    boundary = (|x_int| * max_rng_val / q_max).round().short().
-
-    Returns:
-        boundary: (rows, cols) int16
-        sign: (rows, cols) int8
-        scale_row: (rows,) float32 — per-row dequantization scale
+    Returns (boundary int16, sign int8, scale_row float32).
     """
     rows, cols = fp_tensor.shape
-    q_max = 2 ** (sc_prec - 1) - 1      # 127: q_clip = q_max (clip_margin=0)
+    q_max = 2 ** (sc_prec - 1) - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
 
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
     sign = torch.empty(rows, cols, dtype=torch.int8, device=fp_tensor.device)
     scale_row = torch.empty(rows, dtype=torch.float32, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     COLS_PAD = triton.next_power_of_2(cols)
-    fused_quant_bipolar_perrow_kernel[(rows,)](
-        fp_tensor, boundary, sign, scale_row,
-        q_max, q_max, max_rng_val,
+    fused_quant_kernel[(rows,)](
+        fp_tensor, boundary, sign, scale_row, dummy,
+        0.0, 0.0, q_max, max_rng_val,
         rows, cols, COLS_PAD,
+        IS_BIPOLAR=True, PER_ROW=True,
     )
     return boundary, sign, scale_row
-
-
-@triton.jit
-def fused_quant_unipolar_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int32 output
-    inv_scale,         # float: 1.0 / scale
-    zp,                # float: zero-point
-    q_max,             # int: 2^sc_prec - 1
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    BLOCK: tl.constexpr,
-):
-    """
-    Fused unipolar quantization: FP -> boundary in one kernel.
-
-    For each element x:
-      x_int = round(clamp(x * inv_scale + zp, 0, q_max))
-      boundary = int(x_int * max_rng_val / q_max)
-    """
-    pid = tl.program_id(0)
-    offsets = pid * BLOCK + tl.arange(0, BLOCK)
-    total = rows * cols
-    mask = offsets < total
-
-    x = tl.load(fp_ptr + offsets, mask=mask, other=0.0)
-
-    # Quantize
-    x_scaled = x * inv_scale + zp
-    x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max.to(tl.float32))
-
-    # Boundary
-    boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
-
-    tl.store(boundary_ptr + offsets, boundary, mask=mask)
-
-
-@triton.jit
-def fused_quant_unipolar_with_sum_kernel(
-    fp_ptr,            # (rows, cols) float32 input
-    boundary_ptr,      # (rows, cols) int32 output
-    row_sum_ptr,       # (rows,) float32 output — sum of x_int per row
-    inv_scale,         # float: 1.0 / scale
-    zp,                # float: zero-point
-    q_max,             # int: 2^sc_prec - 1
-    max_rng_val,       # int: 2^sc_prec - 1
-    rows, cols,
-    COLS_BLOCK: tl.constexpr,
-):
-    """
-    Fused unipolar quantization + per-row sum in one kernel.
-
-    Each program handles one row: quantize all cols, compute boundary,
-    and reduce the row's x_int sum for zero-point correction.
-    """
-    row = tl.program_id(0)
-    if row >= rows:
-        return
-
-    col_offsets = tl.arange(0, COLS_BLOCK)
-    col_mask = col_offsets < cols
-    base = row * cols
-
-    x = tl.load(fp_ptr + base + col_offsets, mask=col_mask, other=0.0)
-
-    # Quantize
-    x_scaled = x * inv_scale + zp
-    x_rounded = libdevice.nearbyint(x_scaled)
-    x_clamped = tl.minimum(tl.maximum(x_rounded, 0.0), q_max.to(tl.float32))
-
-    # Boundary
-    boundary = libdevice.nearbyint(x_clamped * (max_rng_val / q_max)).to(tl.int32)
-    tl.store(boundary_ptr + base + col_offsets, boundary, mask=col_mask)
-
-    # Row sum of x_int (for zero-point correction)
-    row_sum = tl.sum(x_clamped, axis=0)
-    tl.store(row_sum_ptr + row, row_sum)
 
 
 def fused_quantize_bipolar(
@@ -992,32 +446,26 @@ def fused_quantize_bipolar(
     sc_prec: int,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, float]:
-    """
-    Fused bipolar quantization: FP -> (boundary, sign) in one kernel launch.
-
-    Returns:
-        boundary: (rows, cols) int16
-        sign: (rows, cols) int8
-        scale: float (for dequantization)
-    """
+    """Fused per-tensor bipolar quantization. Returns (boundary int16, sign int8, scale)."""
     rows, cols = fp_tensor.shape
-    q_norm = 2 ** (sc_prec - 1) - 1     # 127: for SNG boundary normalization
-    q_clip = q_norm - 2                  # 125: quantization range & clamp
+    q_max = 2 ** (sc_prec - 1) - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
     abs_max = max(abs_max, 1e-5)
-    scale = abs_max / q_clip
+    scale = abs_max / q_max
     inv_scale = 1.0 / scale
 
     boundary = torch.empty(rows, cols, dtype=torch.int16, device=fp_tensor.device)
     sign = torch.empty(rows, cols, dtype=torch.int8, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     total = rows * cols
     BLOCK = 1024
     grid = (triton.cdiv(total, BLOCK),)
-    fused_quant_bipolar_kernel[grid](
-        fp_tensor, boundary, sign,
-        inv_scale, q_clip, -q_clip, q_clip, max_rng_val,
+    fused_quant_kernel[grid](
+        fp_tensor, boundary, sign, dummy, dummy,
+        inv_scale, 0.0, q_max, max_rng_val,
         rows, cols, BLOCK,
+        IS_BIPOLAR=True, PER_ROW=False,
     )
     return boundary, sign, scale
 
@@ -1030,48 +478,39 @@ def fused_quantize_unipolar(
     compute_sum: bool = False,
     rng_levels: Optional[int] = None,
 ) -> tuple[torch.Tensor, float, float, float, torch.Tensor | None]:
-    """
-    Fused unipolar quantization: FP -> boundary in one kernel launch.
-
-    Returns:
-        boundary: (rows, cols) int32
-        scale: float
-        zp: float (zero-point)
-        row_sum: (rows,) float32 if compute_sum else None
-    """
+    """Fused unipolar quantization. Returns (boundary int32, scale, zp, row_sum-or-None)."""
     rows, cols = fp_tensor.shape
     q_max = 2 ** sc_prec - 1
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
-    q_lo, q_hi = 2, q_max - 2  # map min->2, max->253 for 8-bit
     range_fp = max(fp_max - fp_min, 1e-5)
-    scale = range_fp / (q_hi - q_lo)
+    scale = range_fp / q_max
     inv_scale = 1.0 / scale
-    zp = round(-fp_min / scale) + q_lo
-    zp = max(q_lo, min(q_hi, zp))
+    zp = round(-fp_min / scale)
+    zp = max(0, min(q_max, zp))
     zp_f = float(zp)
 
     boundary = torch.empty(rows, cols, dtype=torch.int32, device=fp_tensor.device)
+    dummy = _quant_dummy(fp_tensor.device)
 
     if compute_sum:
-        # Use per-row kernel that also computes row sums
         row_sum = torch.empty(rows, dtype=torch.float32, device=fp_tensor.device)
-        # Round cols up to power of 2 for tl.arange
         COLS_BLOCK = triton.next_power_of_2(cols)
-        grid = (rows,)
-        fused_quant_unipolar_with_sum_kernel[grid](
-            fp_tensor, boundary, row_sum,
+        fused_quant_kernel[(rows,)](
+            fp_tensor, boundary, dummy, dummy, row_sum,
             inv_scale, zp_f, q_max, max_rng_val,
             rows, cols, COLS_BLOCK,
+            IS_BIPOLAR=False, PER_ROW=True,
         )
         return boundary, scale, zp_f, row_sum
     else:
         total = rows * cols
         BLOCK = 1024
         grid = (triton.cdiv(total, BLOCK),)
-        fused_quant_unipolar_kernel[grid](
-            fp_tensor, boundary,
+        fused_quant_kernel[grid](
+            fp_tensor, boundary, dummy, dummy, dummy,
             inv_scale, zp_f, q_max, max_rng_val,
             rows, cols, BLOCK,
+            IS_BIPOLAR=False, PER_ROW=False,
         )
         return boundary, scale, zp_f, None
 
@@ -1614,25 +1053,19 @@ def enable_matmul_triton(
     # Warp count tuning: more warps for larger tiles, fewer for smaller
     nw = 8 if BLOCK_M == 32 else 2
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
-    if is_bipolar:
-        enable_matmul_bipolar_tiled_kernel[grid](
-            cum_indicator, k_table,
-            boundary_a, boundary_b,
-            sign_a, sign_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-            num_warps=nw,
-        )
-    else:
-        enable_matmul_unipolar_tiled_kernel[grid](
-            cum_indicator, k_table,
-            boundary_a, boundary_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-            num_warps=nw,
-        )
+    if not is_bipolar:
+        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
+        sign_a = sign_b = _dummy_sign
+    enable_matmul_tiled_kernel[grid](
+        cum_indicator, k_table,
+        boundary_a, boundary_b,
+        sign_a, sign_b,
+        output,
+        N, M, D, stoc_len, V,
+        q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+        IS_BIPOLAR=is_bipolar,
+        num_warps=nw,
+    )
 
     return output
 
@@ -1703,23 +1136,20 @@ def enable_matmul_compact(
     BLOCK_N = 32
     BATCH_T = 32
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(M, BLOCK_N))
-    if is_bipolar:
-        enable_matmul_compact_bipolar_dot_kernel[grid](
-            rng_b, k_table,
-            boundary_a, boundary_b,
-            sign_a, sign_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
-        )
-    else:
-        enable_matmul_compact_unipolar_dot_kernel[grid](
-            rng_b, k_table,
-            boundary_a, boundary_b,
-            output,
-            N, M, D, stoc_len, V,
-            q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
-        )
+    # Unipolar path doesn't read sign pointers (constexpr-branched out).
+    # Pass dummy 1-element int8 tensors; they're never dereferenced inside.
+    if not is_bipolar:
+        _dummy_sign = torch.empty(1, dtype=torch.int8, device=output.device)
+        sign_a = sign_b = _dummy_sign
+    enable_matmul_compact_dot_kernel[grid](
+        rng_b, k_table,
+        boundary_a, boundary_b,
+        sign_a, sign_b,
+        output,
+        N, M, D, stoc_len, V,
+        q_max_sq, BLOCK_M, BLOCK_N, BATCH_T,
+        IS_BIPOLAR=is_bipolar,
+    )
 
     return output
 
@@ -1805,24 +1235,18 @@ def enable_matmul_compact_mlp(
         if is_bipolar:
             sa_chunk = sign_a[:, d_start:d_end].t().contiguous()
             sb_chunk = sign_b[:, d_start:d_end].t().contiguous()
-            enable_matmul_bipolar_tiled_kernel[grid_mm](
-                cum_chunk, k_tab_chunk,
-                ba_chunk, bb_chunk,
-                sa_chunk, sb_chunk,
-                partial,
-                N, M, d_len, stoc_len, V,
-                q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-                num_warps=nw,
-            )
         else:
-            enable_matmul_unipolar_tiled_kernel[grid_mm](
-                cum_chunk, k_tab_chunk,
-                ba_chunk, bb_chunk,
-                partial,
-                N, M, d_len, stoc_len, V,
-                q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
-                num_warps=nw,
-            )
+            sa_chunk = sb_chunk = torch.empty(1, dtype=torch.int8, device=partial.device)
+        enable_matmul_tiled_kernel[grid_mm](
+            cum_chunk, k_tab_chunk,
+            ba_chunk, bb_chunk,
+            sa_chunk, sb_chunk,
+            partial,
+            N, M, d_len, stoc_len, V,
+            q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+            IS_BIPOLAR=is_bipolar,
+            num_warps=nw,
+        )
 
         output += partial
 
@@ -1917,22 +1341,14 @@ def _sc_matmul_per_tensor(
             stoc_len, rng_levels=max_rng_val)
         rng_b_for_compact = None
 
-    if mode == "bipolar":
-        result = _sc_matmul_enable_triton_bipolar(
-            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-            cum_indicator if not use_compact else None,
-            k_table, max_rng_val, N, D, M, stoc_len,
-            rng_b=rng_b_for_compact,
-        )
-    elif mode == "unipolar":
-        result = _sc_matmul_enable_triton_unipolar(
-            a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-            cum_indicator if not use_compact else None,
-            k_table, max_rng_val, N, D, M, stoc_len,
-            rng_b=rng_b_for_compact,
-        )
-    else:
+    if mode not in ("bipolar", "unipolar"):
         raise ValueError(f"Unknown mode: {mode}")
+    result = _sc_matmul_enable_triton(
+        a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
+        cum_indicator if not use_compact else None,
+        k_table, max_rng_val, N, D, M, stoc_len,
+        mode=mode, rng_b=rng_b_for_compact,
+    )
 
     if device.type != 'cuda':
         result = result.to(device)
@@ -1940,74 +1356,55 @@ def _sc_matmul_per_tensor(
     return result
 
 
-def _sc_matmul_enable_triton_bipolar(
+def _sc_matmul_enable_triton(
     a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
     cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+    *,
+    mode: str,
     rng_b=None,
 ):
-    """Bipolar enable-signal SC matmul via Triton (sign-magnitude)."""
-    q_max = 2 ** (sc_prec - 1) - 1
+    """Enable-signal SC matmul via Triton.
 
-    # Fused quantization: FP -> (boundary, sign) in one kernel each
-    abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
-    abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
-    boundary_a, sign_a, scale_a = fused_quantize_bipolar(
-        a, abs_max_a, sc_prec, rng_levels=max_rng_val
-    )
-    boundary_b, sign_b, scale_b = fused_quantize_bipolar(
-        b, abs_max_b, sc_prec, rng_levels=max_rng_val
-    )
-
-    q_max_sq = float(q_max * q_max)
+    ``mode="bipolar"`` uses sign-magnitude (quantize to ±q_max, multiply by
+    ±1 signs inside the kernel). ``mode="unipolar"`` uses asymmetric +
+    zero-point (quantize to [0, q_max], correct for zp on host).
+    """
+    is_bipolar = (mode == "bipolar")
+    if is_bipolar:
+        q_max = 2 ** (sc_prec - 1) - 1
+        q_max_sq = float(q_max * q_max)
+        abs_max_a = max(abs(max_fp_a), abs(min_fp_a), 1e-5)
+        abs_max_b = max(abs(max_fp_b), abs(min_fp_b), 1e-5)
+        boundary_a, sign_a, scale_a = fused_quantize_bipolar(
+            a, abs_max_a, sc_prec, rng_levels=max_rng_val)
+        boundary_b, sign_b, scale_b = fused_quantize_bipolar(
+            b, abs_max_b, sc_prec, rng_levels=max_rng_val)
+    else:
+        q_max_sq = float((2 ** sc_prec - 1) ** 2)
+        boundary_a, scale_a, zp_a_f, a_sum = fused_quantize_unipolar(
+            a, max_fp_a, min_fp_a, sc_prec,
+            compute_sum=True, rng_levels=max_rng_val)
+        boundary_b, scale_b, zp_b_f, b_sum = fused_quantize_unipolar(
+            b, max_fp_b, min_fp_b, sc_prec,
+            compute_sum=True, rng_levels=max_rng_val)
+        sign_a = sign_b = None
 
     if rng_b is not None:
         sc_raw = enable_matmul_compact(
             rng_b, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
     else:
         sc_raw = enable_matmul_triton(
             cum_indicator, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
+
+    if not is_bipolar:
+        # Zero-point correction (a_sum/b_sum already computed by fused kernel)
+        sc_raw = sc_raw + (-zp_b_f * a_sum[:, None]
+                          - zp_a_f * b_sum[None, :]
+                          + D * zp_a_f * zp_b_f)
 
     return sc_raw * (scale_a * scale_b)
-
-
-def _sc_matmul_enable_triton_unipolar(
-    a, b, max_fp_a, min_fp_a, max_fp_b, min_fp_b, sc_prec,
-    cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-    rng_b=None,
-):
-    """Unipolar enable-signal SC matmul via Triton (asymmetric + zero-point)."""
-    q_max_sq = float((2 ** sc_prec - 1) ** 2)
-
-    # Fused quantization + row-sum in one kernel each
-    boundary_a, scale_a, zp_a_f, a_sum = fused_quantize_unipolar(
-        a, max_fp_a, min_fp_a, sc_prec,
-        compute_sum=True, rng_levels=max_rng_val)
-    boundary_b, scale_b, zp_b_f, b_sum = fused_quantize_unipolar(
-        b, max_fp_b, min_fp_b, sc_prec,
-        compute_sum=True, rng_levels=max_rng_val)
-
-    if rng_b is not None:
-        sc_raw = enable_matmul_compact(
-            rng_b, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-    else:
-        sc_raw = enable_matmul_triton(
-            cum_indicator, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-
-    # Zero-point correction (a_sum/b_sum already computed by fused kernel)
-    correction = (-zp_b_f * a_sum[:, None]
-                  - zp_a_f * b_sum[None, :]
-                  + D * zp_a_f * zp_b_f)
-    corrected = sc_raw + correction
-
-    return corrected * (scale_a * scale_b)
 
 
 def _sc_matmul_enable_triton_batched(
@@ -2054,8 +1451,8 @@ def _sc_matmul_enable_triton_bipolar_mlp(
     if group_b <= 0:
         group_b = 1
 
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max, clip_margin=0)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max, clip_margin=0)
+    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
+    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
 
     # Convert quantized integers to boundaries for enable-signal lookup
     max_rng_val = _resolve_rng_levels(sc_prec, rng_levels)
@@ -2172,13 +1569,14 @@ def _sc_matmul_bipolar_mlp_chunked(
         sign_b_t = sign_b.t().contiguous()
 
         # Fast tiled matmul with O(1) cum_indicator lookup
-        enable_matmul_bipolar_tiled_kernel[grid_mm](
+        enable_matmul_tiled_kernel[grid_mm](
             cum_chunk, k_tab_chunk,
             boundary_a_t, boundary_b_t,
             sign_a_t, sign_b_t,
             partial,
             N, M, d_len, stoc_len, V,
             q_max_sq, BLOCK_M, BLOCK_N, BLOCK_K,
+            IS_BIPOLAR=True,
             num_warps=nw,
         )
 
@@ -2435,48 +1833,27 @@ def _sc_matmul_per_row(
     cum_table_bytes = D * (stoc_len + 1) * V * 2
     use_compact = cum_table_bytes > _COMPACT_ENABLE_THRESHOLD_BYTES
 
-    if mode == "bipolar":
-        # Bipolar grouped quantization path
-        if use_compact:
-            k_table = _get_cached_k_table(
-                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
-            )
-            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
-            result = _sc_matmul_bipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                None, k_table, max_rng_val, N, D, M, stoc_len,
-                rng_b=rng_b,
-            )
-        else:
-            cum_indicator, k_table = _get_cached_enable_tables(
-                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
-                stoc_len, rng_levels=max_rng_val)
-            result = _sc_matmul_bipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-            )
-    elif mode == "unipolar":
-        # Unipolar grouped quantization path
-        if use_compact:
-            k_table = _get_cached_k_table(
-                config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
-            )
-            rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
-            result = _sc_matmul_unipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                None, k_table, max_rng_val, N, D, M, stoc_len,
-                rng_b=rng_b,
-            )
-        else:
-            cum_indicator, k_table = _get_cached_enable_tables(
-                config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
-                stoc_len, rng_levels=max_rng_val)
-            result = _sc_matmul_unipolar_grouped_enable(
-                a, b, group_a, group_b, sc_prec,
-                cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-            )
-    else:
+    if mode not in ("bipolar", "unipolar"):
         raise ValueError(f"Unknown mode: {mode}")
+    if use_compact:
+        k_table = _get_cached_k_table(
+            config, sc_prec, a.device, rand_seqs_a_t, stoc_len, rng_levels=max_rng_val
+        )
+        rng_b = _prepare_rng_prefix(rand_seqs_b_t, sc_prec, stoc_len, max_rng_val)
+        result = _sc_matmul_grouped_enable(
+            a, b, group_a, group_b, sc_prec,
+            None, k_table, max_rng_val, N, D, M, stoc_len,
+            mode=mode, rng_b=rng_b,
+        )
+    else:
+        cum_indicator, k_table = _get_cached_enable_tables(
+            config, sc_prec, a.device, rand_seqs_a_t, rand_seqs_b_t,
+            stoc_len, rng_levels=max_rng_val)
+        result = _sc_matmul_grouped_enable(
+            a, b, group_a, group_b, sc_prec,
+            cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+            mode=mode,
+        )
 
     if device.type != 'cuda':
         result = result.to(device)
@@ -2484,110 +1861,62 @@ def _sc_matmul_per_row(
     return result
 
 
-def _sc_matmul_bipolar_grouped_enable(
+def _sc_matmul_grouped_enable(
     a, b, group_a, group_b, sc_prec,
     cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
+    *,
+    mode: str,
     rng_b=None,
 ):
-    """Bipolar enable-signal SC matmul with per-row-group quantization.
+    """Enable-signal SC matmul with per-row-group quantization.
 
-    Uses _grouped_symmetric_quant for host-side quantization,
-    then enable-signal table-lookup kernel with sign handling.
+    Bipolar: symmetric quant via _grouped_symmetric_quant → sign-magnitude SC.
+    Unipolar: asymmetric quant via _grouped_asymmetric_quant → zp correction.
+    Both share the same enable-signal matmul kernel suite.
     """
-    q_max = 2 ** (sc_prec - 1) - 1
-
-    # Per-row-group symmetric quantization
-    scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max, clip_margin=0)
-    scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max, clip_margin=0)
-
-    # Compute boundaries for enable-signal lookup
-    abs_a_int = a_int.abs()
-    abs_b_int = b_int.abs()
-    boundary_a = (abs_a_int * max_rng_val / q_max).round().short()  # (N, D)
-    boundary_b = (abs_b_int * max_rng_val / q_max).round().short()  # (M, D)
+    is_bipolar = (mode == "bipolar")
+    if is_bipolar:
+        q_max = 2 ** (sc_prec - 1) - 1
+        scale_a_row, a_int, sign_a = _grouped_symmetric_quant(a, group_a, q_max)
+        scale_b_row, b_int, sign_b = _grouped_symmetric_quant(b, group_b, q_max)
+        boundary_a = (a_int.abs() * max_rng_val / q_max).round().short()
+        boundary_b = (b_int.abs() * max_rng_val / q_max).round().short()
+    else:
+        q_max = 2 ** sc_prec - 1
+        scale_a_row, zp_a_row, a_int = _grouped_asymmetric_quant(a, group_a, q_max)
+        scale_b_row, zp_b_row, b_int = _grouped_asymmetric_quant(b, group_b, q_max)
+        boundary_a = (a_int * max_rng_val / q_max).round().short()
+        boundary_b = (b_int * max_rng_val / q_max).round().short()
+        sign_a = sign_b = None
 
     q_max_sq = float(q_max * q_max)
-
-    # Enable-signal matmul with sign handling (bipolar)
     if rng_b is not None:
         sc_raw = enable_matmul_compact(
             rng_b, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
     else:
         sc_raw = enable_matmul_triton(
             cum_indicator, k_table, boundary_a, boundary_b,
-            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=True,
-        )
+            sign_a, sign_b, N, M, D, stoc_len, q_max_sq, is_bipolar=is_bipolar)
 
-    # Per-element dequantization (no zero-point correction needed for symmetric)
-    result_fp = sc_raw * (scale_a_row[:, None] * scale_b_row[None, :])
+    if not is_bipolar:
+        # Per-element zero-point correction
+        a_sum = a_int.sum(dim=1)
+        b_sum = b_int.sum(dim=1)
+        sc_raw = sc_raw + (-zp_b_row[None, :] * a_sum[:, None]
+                          - zp_a_row[:, None] * b_sum[None, :]
+                          + D * zp_a_row[:, None] * zp_b_row[None, :])
 
-    return result_fp
-
-
-def _sc_matmul_unipolar_grouped_enable(
-    a, b, group_a, group_b, sc_prec,
-    cum_indicator, k_table, max_rng_val, N, D, M, stoc_len,
-    rng_b=None,
-):
-    """
-    Unipolar enable-signal SC matmul with per-row-group quantization.
-
-    Uses _grouped_asymmetric_quant for host-side quantization (same as standard),
-    then enable-signal table-lookup kernel instead of packed AND matmul.
-    """
-    q_max = 2 ** sc_prec - 1
-
-    # Per-row-group asymmetric quantization (reuse existing helper)
-    scale_a_row, zp_a_row, a_int = _grouped_asymmetric_quant(a, group_a, q_max)
-    scale_b_row, zp_b_row, b_int = _grouped_asymmetric_quant(b, group_b, q_max)
-
-    # Compute boundaries for enable-signal lookup
-    boundary_a = (a_int * max_rng_val / q_max).round().short()  # (N, D)
-    boundary_b = (b_int * max_rng_val / q_max).round().short()  # (M, D)
-
-    q_max_sq = float(q_max * q_max)
-
-    # Enable-signal matmul: compact or table-based
-    if rng_b is not None:
-        sc_raw = enable_matmul_compact(
-            rng_b, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-    else:
-        sc_raw = enable_matmul_triton(
-            cum_indicator, k_table, boundary_a, boundary_b,
-            None, None, N, M, D, stoc_len, q_max_sq, is_bipolar=False,
-        )
-
-    # Per-element zero-point correction (same as standard grouped)
-    a_sum = a_int.sum(dim=1)   # (N,)
-    b_sum = b_int.sum(dim=1)   # (M,)
-
-    correction = (
-        -zp_b_row[None, :] * a_sum[:, None]
-        - zp_a_row[:, None] * b_sum[None, :]
-        + D * zp_a_row[:, None] * zp_b_row[None, :]
-    )
-    corrected = sc_raw + correction
-
-    # Per-element dequantization
-    result_fp = corrected * (scale_a_row[:, None] * scale_b_row[None, :])
-
-    return result_fp
+    return sc_raw * (scale_a_row[:, None] * scale_b_row[None, :])
 
 
-def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
+def _grouped_symmetric_quant(x, G, q_max):
     """Per-row-group symmetric quantization for bipolar mode.
 
     Args:
         x: (rows, cols) float tensor
         G: number of rows per quantization group
         q_max: max quantized value (e.g. 127 for 8-bit bipolar)
-        clip_margin: headroom levels for outliers (default 2).
-                     scale uses q_max - clip_margin, clamp uses q_max.
-                     Set to 0 to disable clipping (standard quantization).
 
     Returns:
         scale_row: (rows,) per-row scale
@@ -2595,12 +1924,11 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
         sign:      (rows, cols) sign bits (+1/-1)
     """
     rows, cols = x.shape
-    q_clip = q_max - clip_margin
 
     if G >= rows:
         # Single group (per-tensor) — fast path
         abs_max = x.abs().max().clamp(min=1e-5)
-        scale = abs_max / q_clip  # use q_clip so dequant amplifies
+        scale = abs_max / q_max
         x_int = (x / scale).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign[sign == 0] = 1  # Handle zeros as positive
@@ -2616,7 +1944,7 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
     if num_full > 0:
         x_full = x[:num_full * G].reshape(num_full, G, cols)
         gabs_max = x_full.abs().amax(dim=(1, 2)).clamp(min=1e-5)  # (num_full,)
-        gscale = gabs_max / q_clip  # use q_clip so dequant amplifies
+        gscale = gabs_max / q_max
 
         # Expand scales for broadcasting
         gscale_exp = gscale[:, None, None].expand(num_full, G, cols)
@@ -2631,7 +1959,7 @@ def _grouped_symmetric_quant(x, G, q_max, clip_margin=0):
     if rem > 0:
         x_rem = x[num_full * G:]
         rabs_max = x_rem.abs().max().clamp(min=1e-5)
-        rscale = rabs_max / q_clip  # use q_clip so dequant amplifies
+        rscale = rabs_max / q_max
         x_rem_quant = (x_rem / rscale).round().clamp(-q_max, q_max)
         x_rem_sign = torch.sign(x_rem_quant).to(torch.int8)
         x_rem_sign[x_rem_sign == 0] = 1
@@ -2762,7 +2090,7 @@ def _pick_enable_block_sizes(rows_a: int, rows_b: int, D: int) -> tuple:
 # Ported from vit_sc/sc/sc_triton.py.
 # =============================================================================
 
-def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
+def _grouped_symmetric_quant_batched(x, G, q_max):
     """Batched per-row-group symmetric quant. ``x`` is (BH, rows, cols).
 
     Currently only ``G == 1`` (per-row) and ``G >= rows`` (per-batch-tensor)
@@ -2770,11 +2098,10 @@ def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
     """
     assert x.dim() == 3, f"expected (BH, rows, cols), got {tuple(x.shape)}"
     BH, rows, cols = x.shape
-    q_clip = q_max - clip_margin
 
     if G >= rows:
         abs_max = x.abs().amax(dim=(1, 2)).clamp(min=1e-5)        # (BH,)
-        scale = abs_max / q_clip                                    # (BH,)
+        scale = abs_max / q_max                                    # (BH,)
         x_int = (x / scale[:, None, None]).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
@@ -2782,7 +2109,7 @@ def _grouped_symmetric_quant_batched(x, G, q_max, clip_margin=0):
 
     if G == 1:
         abs_max = x.abs().amax(dim=2).clamp(min=1e-5)               # (BH, rows)
-        scale = abs_max / q_clip                                    # (BH, rows)
+        scale = abs_max / q_max                                    # (BH, rows)
         x_int = (x / scale[:, :, None]).round().clamp(-q_max, q_max)
         sign = torch.sign(x_int).to(torch.int8)
         sign = torch.where(sign == 0, torch.ones_like(sign), sign)
@@ -2876,9 +2203,9 @@ def _sc_matmul_per_row_batched(
     q_max_sq = float(q_max * q_max)
 
     scale_a_row, a_int, sign_a = _grouped_symmetric_quant_batched(
-        a, group_a, q_max, clip_margin=0)         # scale (BH, M); a_int/sign (BH, M, D)
+        a, group_a, q_max)                         # scale (BH, M); a_int/sign (BH, M, D)
     scale_b_row, b_int, sign_b = _grouped_symmetric_quant_batched(
-        b, group_b, q_max, clip_margin=0)         # scale (BH, N); b_int/sign (BH, N, D)
+        b, group_b, q_max)                         # scale (BH, N); b_int/sign (BH, N, D)
 
     boundary_a = (a_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, M, D)
     boundary_b = (b_int.abs() * (max_rng_val / q_max)).round().short()  # (BH, N, D)

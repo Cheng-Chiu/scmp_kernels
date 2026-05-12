@@ -1,21 +1,27 @@
 """Stochastic-computing kernels.
 
-Public surface: a single ``sc_matmul`` function with a ``granularity``
-parameter ("per_tensor" / "per_row" / "per_head"). All inputs/outputs
-are float32; quantization happens inside the Triton kernels.
+Public surface:
 
-The five specialized internal kernels and the ``det_kernel_tuning``
-context manager are exposed as semi-public for callers that need fine-
-grained access (e.g. per-head batched QK with caller-computed ranges).
+* ``sc_matmul`` — unified granularity-dispatcher. Accepts
+  ``granularity={"per_tensor","per_row","per_head"}`` plus orthogonal
+  knobs (``mode``, ``sc_prec``, ``stoc_len``, ``chunk_d``,
+  ``group_a``/``group_b``, ``rng_levels``, ``config``). All historical
+  specialized entry points (per-tensor, per-row, per-row-MLP,
+  per-row-grouped, per-head-bipolar) are reachable through this single
+  function.
+* ``clear_rng_cache`` — drop cached RNG sequences (call after changing
+  Sobol/Owen env vars or rotating seeds).
+* ``det_kernel_tuning`` — context manager opting in to det-tuned tile
+  sizes on the batched grouped path.
+
+All inputs/outputs are float32; quantization happens inside the Triton kernels.
 """
 
 from .matmul import sc_matmul
-
-# Semi-public — context manager opting in to det-tuned tile sizes on the
-# batched grouped path.
-from .kernels import det_kernel_tuning
+from .kernels import clear_rng_cache, det_kernel_tuning
 
 __all__ = [
     "sc_matmul",
+    "clear_rng_cache",
     "det_kernel_tuning",
 ]

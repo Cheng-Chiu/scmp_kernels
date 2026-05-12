@@ -41,6 +41,9 @@ def sc_matmul(
     sc_prec: int = 8,
     stoc_len: Optional[int] = None,
     chunk_d: int = 0,
+    group_a: int = 1,
+    group_b: int = 1,
+    rng_levels: Optional[int] = None,
     config: Optional[dict] = None,
 ) -> torch.Tensor:
     """Stochastic-computing matmul ``a @ b.T``.
@@ -53,8 +56,9 @@ def sc_matmul(
 
             * ``"per_tensor"`` — one ``(max, min)`` for the whole matrix.
               Computed via ``a.max() / a.min()``.
-            * ``"per_row"`` (default) — one ``(max, min)`` per row of ``a``
-              and per row of ``b``. Computed inside the fused-quant kernel.
+            * ``"per_row"`` (default) — per-row-group quantization. With
+              ``group_a=group_b=1`` (default) this is true per-row.
+              Use ``group_a=N`` to fall back to per-tensor on operand ``a``.
             * ``"per_head"`` — one ``(max, min)`` per leading-dim slice
               (e.g. per attention head). Requires 3D input. Currently
               ``mode="bipolar"`` only.
@@ -71,6 +75,13 @@ def sc_matmul(
             Splits ``D`` into chunks of ``chunk_d`` so the ``cum_indicator``
             table fits in L2 cache — required for wide MLP layers
             (e.g. ``D >= 1024``).
+        group_a, group_b: per-row quantization group sizes for ``a`` and ``b``
+            (used only with ``granularity="per_row"``). ``1`` = per-row,
+            ``N``/``M`` = per-tensor.
+        rng_levels: enable-signal RNG grid size for fixed-level precision.
+            When ``None`` (default) the grid follows ``sc_prec``. Pass a
+            specific integer to keep an int8 quant grid while varying
+            ``stoc_len``.
         config: optional Sobol RNG/SNG config dict. Auto-built when ``None``.
 
     Returns:
@@ -145,21 +156,21 @@ def sc_matmul(
             return _sc_matmul_per_row_mlp(
                 a, b,
                 mode=mode, sc_prec=sc_prec, config=config,
-                group_a=1, group_b=1, chunk_d=chunk_d,
-                stoc_len=stoc_len,
+                group_a=group_a, group_b=group_b, chunk_d=chunk_d,
+                stoc_len=stoc_len, rng_levels=rng_levels,
             )
         if a.dim() == 3:
             return _sc_matmul_per_row_batched(
                 a, b,
-                group_a=1, group_b=1,
+                group_a=group_a, group_b=group_b,
                 mode=mode, sc_prec=sc_prec, config=config,
                 stoc_len=stoc_len,
             )
         return _sc_matmul_per_row(
             a, b,
-            group_a=1, group_b=1,
+            group_a=group_a, group_b=group_b,
             mode=mode, sc_prec=sc_prec, config=config,
-            stoc_len=stoc_len,
+            stoc_len=stoc_len, rng_levels=rng_levels,
         )
 
     # granularity == "per_head" — bipolar, 3D, already validated above.
@@ -179,5 +190,5 @@ def sc_matmul(
         q_maxs=a_maxs, q_mins=a_mins,
         k_maxs=b_maxs, k_mins=b_mins,
         sc_prec=sc_prec, config=config,
-        stoc_len=stoc_len,
+        stoc_len=stoc_len, rng_levels=rng_levels,
     )
