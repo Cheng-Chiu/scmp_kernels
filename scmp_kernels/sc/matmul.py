@@ -15,6 +15,7 @@ behind an explicit ``a_observer=`` kwarg if ever needed.
 from __future__ import annotations
 
 import functools
+import contextlib
 from typing import Optional
 
 import torch
@@ -59,7 +60,26 @@ def wrapper(a, b, *args, **kwargs):
 
 @_pin_to_operand_device
 @torch.no_grad()
-def sc_matmul(
+def sc_matmul(a: torch.Tensor, b: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+    """Device-guarded public entry point. See :func:`_sc_matmul_impl` for the
+    full API (this forwards all arguments unchanged).
+
+    The Triton kernels launch on ``torch.cuda.current_device()`` (cuda:0 by
+    default). Under ``device_map="auto"`` model sharding, a layer's tensors can
+    live on cuda:1 while the kernel still launches in the cuda:0 context, which
+    dereferences cuda:1 pointers from a cuda:0 launch -> ``CUDA error: an
+    illegal memory access was encountered``. Entering ``a``'s device makes every
+    launch (and the per-head/batched stream contexts) target the right GPU. This
+    is a no-op on single-GPU and on CPU inputs.
+    """
+    guard = (torch.cuda.device(a.device)
+             if a.is_cuda else contextlib.nullcontext())
+    with guard:
+        return _sc_matmul_impl(a, b, *args, **kwargs)
+
+
+@torch.no_grad()
+def _sc_matmul_impl(
     a: torch.Tensor,
     b: torch.Tensor,
     granularity: str = "per_row",
